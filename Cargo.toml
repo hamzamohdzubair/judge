@@ -9,6 +9,7 @@ keywords = ["interview", "hiring", "cli", "feedback", "recruiter"]
 categories = ["command-line-utilities"]
 repository = "https://github.com/hamzamohdzubair/judge"
 homepage = "https://github.com/hamzamohdzubair/judge"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1"
