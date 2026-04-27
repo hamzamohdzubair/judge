@@ -1,101 +1,63 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Interview {
+#[derive(Debug, Clone)]
+pub struct Candidate {
+    pub id: i64,
+    pub name: String,
+    pub role: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A single interview question loaded from a .md question bank file.
+/// Never stored in the DB — loaded fresh from ~/.judge/qb/ each run.
+#[derive(Debug, Clone)]
+pub struct Question {
+    /// hex(sha256(topic + "::" + text))[..16] — stable content hash
     pub id: String,
-    pub candidate: String,
-    pub role: Option<String>,
-    pub interviewer: Option<String>,
-    pub started_at: DateTime<Utc>,
-    pub closed_at: Option<DateTime<Utc>>,
-    pub status: Status,
-    pub notes: Vec<Note>,
-    pub ratings: HashMap<String, u8>,
-    pub verdict: Option<Verdict>,
-    pub summary: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum Status {
-    Active,
-    Closed,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Note {
-    pub timestamp: DateTime<Utc>,
+    #[allow(dead_code)]
+    pub topic: String,
+    pub level: u8,
     pub text: String,
-    pub tag: Option<String>,
+    /// Index 0 = level-1 keywords, index 3 = level-4 keywords
+    pub keywords: [Vec<String>; 4],
+    /// True when the question heading has the [AI] marker
+    pub ai_generated: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Verdict {
-    StrongHire,
-    Hire,
-    NoHire,
-    StrongNoHire,
+#[derive(Debug, Clone)]
+pub struct TopicData {
+    pub name: String,
+    pub questions: Vec<Question>,
 }
 
-impl std::fmt::Display for Verdict {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Verdict::StrongHire => write!(f, "Strong Hire"),
-            Verdict::Hire => write!(f, "Hire"),
-            Verdict::NoHire => write!(f, "No Hire"),
-            Verdict::StrongNoHire => write!(f, "Strong No Hire"),
-        }
+impl TopicData {
+    pub fn max_score(&self) -> u32 {
+        self.questions.iter().map(|q| 4 * q.level as u32).sum()
+    }
+
+    pub fn max_score_asked(&self, responses: &HashMap<String, u8>) -> u32 {
+        self.questions
+            .iter()
+            .filter(|q| responses.contains_key(&q.id))
+            .map(|q| 4 * q.level as u32)
+            .sum()
+    }
+
+    pub fn score(&self, responses: &HashMap<String, u8>) -> u32 {
+        self.questions
+            .iter()
+            .map(|q| responses.get(&q.id).copied().unwrap_or(0) as u32 * q.level as u32)
+            .sum()
+    }
+
+    pub fn answered(&self, responses: &HashMap<String, u8>) -> usize {
+        self.questions.iter().filter(|q| responses.contains_key(&q.id)).count()
     }
 }
 
-impl std::str::FromStr for Verdict {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let normalized = s.to_lowercase().replace(['-', '_', ' '], "");
-        match normalized.as_str() {
-            "stronghire" => Ok(Verdict::StrongHire),
-            "hire" => Ok(Verdict::Hire),
-            "nohire" => Ok(Verdict::NoHire),
-            "strongnohire" => Ok(Verdict::StrongNoHire),
-            _ => Err(format!(
-                "Unknown verdict '{}'. Use: hire, no-hire, strong-hire, strong-no-hire",
-                s
-            )),
-        }
-    }
-}
-
-impl Interview {
-    pub fn new(
-        candidate: String,
-        role: Option<String>,
-        interviewer: Option<String>,
-    ) -> Self {
-        let id = Uuid::new_v4().to_string()[..8].to_string();
-        Self {
-            id,
-            candidate,
-            role,
-            interviewer,
-            started_at: Utc::now(),
-            closed_at: None,
-            status: Status::Active,
-            notes: Vec::new(),
-            ratings: HashMap::new(),
-            verdict: None,
-            summary: None,
-        }
-    }
-
-    pub fn average_rating(&self) -> Option<f32> {
-        if self.ratings.is_empty() {
-            return None;
-        }
-        let sum: u32 = self.ratings.values().map(|&v| v as u32).sum();
-        Some(sum as f32 / self.ratings.len() as f32)
-    }
+pub struct Response {
+    pub candidate_id: i64,
+    pub question_id: String,
+    pub score: u8,
 }

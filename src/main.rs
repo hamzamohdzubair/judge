@@ -1,21 +1,25 @@
 use anyhow::{bail, Result};
-use chrono::Local;
 use clap::{Parser, Subcommand};
-use colored::Colorize;
+use std::path::PathBuf;
 
+mod config;
+mod db;
+mod export;
+mod llm;
 mod models;
-mod store;
+mod pdf;
+mod qb;
+mod roles;
+mod tui;
 
-use models::{Interview, Note, Status, Verdict};
-use store::Store;
+use db::Db;
+use export::{ExportData, to_csv, to_html, to_json, write_output, write_output_bytes};
 
 #[derive(Parser)]
 #[command(
     name = "judge",
     version,
-    about = "Interview panel tool for technical interviewers",
-    long_about = "Quickly capture timestamped notes, rate candidates across key dimensions, \
-                  and generate shareable feedback reports — all from your terminal."
+    about = "TUI interview evaluation tool with question banks and live scoring"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -24,398 +28,227 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start a new interview session
-    New {
-        /// Candidate's full name
-        candidate: String,
-        /// Job role being interviewed for
-        #[arg(short, long)]
+    /// Start a new interview or re-open an existing one
+    Start {
+        /// Candidate ID to re-open (omit to create new)
+        id: Option<i64>,
+
+        /// Candidate's full name (required for new)
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Role slug or name, e.g. "data science" (required for new)
+        #[arg(long)]
         role: Option<String>,
-        /// Your name as the interviewer
+    },
+
+    /// List all candidates
+    #[command(name = "ls")]
+    List,
+
+    /// Export interview results
+    Export {
+        /// Format: json, csv, html, pdf
+        format: String,
+
+        /// Candidate ID
+        id: i64,
+
+        /// Write to this file (default: <id>.<ext>)
         #[arg(short, long)]
-        interviewer: Option<String>,
+        output: Option<PathBuf>,
+
+        /// Copy to clipboard instead of writing a file
+        #[arg(short = 'c', long)]
+        clipboard: bool,
     },
-    /// List all interview sessions
-    List {
-        /// Show only active interviews
-        #[arg(short, long)]
-        active: bool,
+
+    /// Question bank commands
+    Qb {
+        #[command(subcommand)]
+        command: QbCommands,
     },
-    /// Show details of an interview
-    Show {
-        /// Interview ID (or unique prefix)
-        id: String,
-    },
-    /// Add a timestamped note to an interview
-    Note {
-        /// Interview ID (or unique prefix)
-        id: String,
-        /// Note text
-        text: String,
-        /// Optional tag (e.g. strength, concern, red-flag)
-        #[arg(short, long)]
-        tag: Option<String>,
-    },
-    /// Rate a candidate on a dimension (score 1–10)
-    Rate {
-        /// Interview ID (or unique prefix)
-        id: String,
-        /// Dimension: technical, problem-solving, communication, culture
-        category: String,
-        /// Score from 1 (poor) to 10 (exceptional)
-        score: u8,
-    },
-    /// Close an interview with a hiring verdict
-    Close {
-        /// Interview ID (or unique prefix)
-        id: String,
-        /// Verdict: hire, no-hire, strong-hire, strong-no-hire
-        verdict: String,
-        /// Optional closing summary
-        #[arg(short, long)]
-        summary: Option<String>,
-    },
-    /// Print a formatted report for an interview
-    Report {
-        /// Interview ID (or unique prefix)
-        id: String,
-    },
-    /// Delete an interview permanently
-    Delete {
-        /// Interview ID (or unique prefix)
-        id: String,
-        /// Skip confirmation prompt
-        #[arg(short, long)]
-        yes: bool,
+}
+
+#[derive(Subcommand)]
+enum QbCommands {
+    /// Generate questions for a topic using the Groq LLM (requires GROQ_API_KEY)
+    Gen {
+        /// Topic name, e.g. "nlp" or "machine learning"
+        topic: String,
+
+        /// Comma-separated question counts per level: l1,l2,l3,l4
+        #[arg(long, default_value = "3,3,2,2")]
+        num: String,
+
+        /// Append to existing file without prompting
+        #[arg(long = "app")]
+        append: bool,
     },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let mut store = Store::load()?;
+    config::ensure_first_run_setup()?;
 
     match cli.command {
-        Commands::New { candidate, role, interviewer } => {
-            let interview = Interview::new(candidate.clone(), role.clone(), interviewer);
-            let id = interview.id.clone();
-            store.interviews.insert(id.clone(), interview);
-            store.save()?;
-
-            println!("{} Interview started for {}", "✓".green().bold(), candidate.bold());
-            println!("  ID:   {}", id.cyan().bold());
-            if let Some(r) = &role {
-                println!("  Role: {}", r);
-            }
-            println!();
-            println!("  {} judge note {} \"your note\"", "Add note:".dimmed(), id);
-            println!("  {} judge rate {} technical 8", "Rate:    ".dimmed(), id);
-            println!("  {} judge close {} hire", "Close:   ".dimmed(), id);
+        Commands::Start { id, name, role } => cmd_start(id, name, role),
+        Commands::List => cmd_list(),
+        Commands::Export { format, id, output, clipboard } => {
+            cmd_export(&format, id, output.as_ref(), clipboard)
         }
-
-        Commands::List { active } => {
-            let mut interviews: Vec<&Interview> = store.interviews.values().collect();
-            if active {
-                interviews.retain(|i| i.status == Status::Active);
-            }
-            interviews.sort_by(|a, b| b.started_at.cmp(&a.started_at));
-
-            if interviews.is_empty() {
-                println!("{}", "No interviews found.".dimmed());
-                return Ok(());
-            }
-
-            for i in &interviews {
-                let status = match i.status {
-                    Status::Active => "active".green().to_string(),
-                    Status::Closed => "closed".dimmed().to_string(),
-                };
-                let role = i.role.as_deref().unwrap_or("—");
-                let avg = i
-                    .average_rating()
-                    .map(|r| format!("{:.1}/10", r))
-                    .unwrap_or_else(|| "—".to_string());
-                let verdict = i
-                    .verdict
-                    .as_ref()
-                    .map(|v| format!(" → {}", v))
-                    .unwrap_or_default();
-                let date = i
-                    .started_at
-                    .with_timezone(&Local)
-                    .format("%Y-%m-%d")
-                    .to_string();
-
-                println!(
-                    "  {} {} {}  {} {}{}",
-                    i.id.cyan(),
-                    i.candidate.bold(),
-                    format!("({})", role).dimmed(),
-                    status,
-                    avg.dimmed(),
-                    verdict,
-                );
-                println!("     {}", date.dimmed());
-            }
+        Commands::Qb { command: QbCommands::Gen { topic, num, append } } => {
+            cmd_qb_gen(&topic, &num, append)
         }
+    }
+}
 
-        Commands::Show { id } => {
-            let interview = store
-                .find_by_prefix(&id)
-                .ok_or_else(|| anyhow::anyhow!("Interview '{}' not found", id))?;
-            print_interview(interview);
+// ── Commands ──────────────────────────────────────────────────────────────────
+
+fn cmd_start(id: Option<i64>, name: Option<String>, role: Option<String>) -> Result<()> {
+    let db = Db::open()?;
+
+    let (candidate, topics, responses) = match id {
+        Some(cid) if name.is_none() => {
+            // Resume existing
+            let c = db.get_candidate(cid)?
+                .ok_or_else(|| anyhow::anyhow!("No candidate found with ID {}", cid))?;
+            let role_slug = qb::slugify(&c.role);
+            let topics = roles::load_topics_for_role(&role_slug)?;
+            let responses = db.load_responses(c.id)?;
+            println!("Resuming interview for {} ({})", c.name, c.id);
+            (c, topics, responses)
         }
+        _ => {
+            // New candidate
+            let cand_name = name.ok_or_else(|| anyhow::anyhow!("--name is required for a new interview"))?;
+            let role_raw = role.ok_or_else(|| anyhow::anyhow!("--role is required for a new interview"))?;
+            let role_slug = qb::slugify(&role_raw);
 
-        Commands::Note { id, text, tag } => {
-            let iid = store
-                .find_id_by_prefix(&id)
-                .ok_or_else(|| anyhow::anyhow!("Interview '{}' not found", id))?;
-            {
-                let interview = store.interviews.get_mut(&iid).unwrap();
-                if interview.status == Status::Closed {
-                    bail!("Cannot add notes to a closed interview");
-                }
-                interview.notes.push(Note {
-                    timestamp: chrono::Utc::now(),
-                    text: text.clone(),
-                    tag: tag.clone(),
-                });
-            }
-            store.save()?;
-            let tag_str = tag
-                .as_deref()
-                .map(|t| format!(" [{}]", t).yellow().to_string())
-                .unwrap_or_default();
-            println!("{} Note added{}", "✓".green(), tag_str);
+            let topics = roles::load_topics_for_role(&role_slug)?;
+            let total_q: usize = topics.iter().map(|t| t.questions.len()).sum();
+
+            let candidate = db.create_candidate(cand_name, role_slug.clone())?;
+
+            println!("Started interview: {} ({})", candidate.name, candidate.id);
+            println!("Role: {}  ·  {} topics  ·  {} questions", role_slug, topics.len(), total_q);
+
+            (candidate, topics, std::collections::HashMap::new())
         }
+    };
 
-        Commands::Rate { id, category, score } => {
-            if score < 1 || score > 10 {
-                bail!("Score must be between 1 and 10, got {}", score);
-            }
-            let iid = store
-                .find_id_by_prefix(&id)
-                .ok_or_else(|| anyhow::anyhow!("Interview '{}' not found", id))?;
-            let prev = {
-                let interview = store.interviews.get_mut(&iid).unwrap();
-                if interview.status == Status::Closed {
-                    bail!("Cannot rate a closed interview");
-                }
-                interview.ratings.insert(category.clone(), score)
-            };
-            store.save()?;
-            if let Some(p) = prev {
-                println!(
-                    "{} {} updated: {} → {}/10  {}",
-                    "✓".green(),
-                    category,
-                    p,
-                    score,
-                    rating_bar(score)
-                );
-            } else {
-                println!("{} {} rated: {}/10  {}", "✓".green(), category, score, rating_bar(score));
-            }
-        }
+    tui::run(db, candidate, topics, responses)
+}
 
-        Commands::Close { id, verdict, summary } => {
-            let verdict_parsed: Verdict = verdict
-                .parse()
-                .map_err(|e: String| anyhow::anyhow!(e))?;
-            let iid = store
-                .find_id_by_prefix(&id)
-                .ok_or_else(|| anyhow::anyhow!("Interview '{}' not found", id))?;
-            {
-                let interview = store.interviews.get_mut(&iid).unwrap();
-                if interview.status == Status::Closed {
-                    bail!("Interview is already closed");
-                }
-                interview.status = Status::Closed;
-                interview.closed_at = Some(chrono::Utc::now());
-                interview.verdict = Some(verdict_parsed.clone());
-                interview.summary = summary;
-            }
-            store.save()?;
-            println!(
-                "{} Interview closed — Verdict: {}",
-                "✓".green(),
-                verdict_parsed.to_string().bold()
-            );
-            println!(
-                "  Run {} for the full report.",
-                format!("judge report {}", iid).cyan()
-            );
-        }
+fn cmd_list() -> Result<()> {
+    let db = Db::open()?;
+    let candidates = db.list_candidates()?;
 
-        Commands::Report { id } => {
-            let interview = store
-                .find_by_prefix(&id)
-                .ok_or_else(|| anyhow::anyhow!("Interview '{}' not found", id))?;
-            print_report(interview);
-        }
+    if candidates.is_empty() {
+        println!("No candidates yet. Run: judge start --name 'Name' --role 'role'");
+        return Ok(());
+    }
 
-        Commands::Delete { id, yes } => {
-            let iid = store
-                .find_id_by_prefix(&id)
-                .ok_or_else(|| anyhow::anyhow!("Interview '{}' not found", id))?;
-            let candidate = store.interviews[&iid].candidate.clone();
+    println!("{:<5} {:<22} {:<20} {:<12} {}",
+        "ID", "Name", "Role", "Answered", "Date");
+    println!("{}", "─".repeat(67));
 
-            if !yes {
-                eprint!("Delete interview for {}? [y/N] ", candidate.bold());
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input)?;
-                if input.trim().to_lowercase() != "y" {
-                    println!("Aborted.");
-                    return Ok(());
-                }
-            }
-            store.interviews.remove(&iid);
-            store.save()?;
-            println!("{} Deleted interview for {}", "✓".green(), candidate);
-        }
+    for c in &candidates {
+        let role_slug = qb::slugify(&c.role);
+        let topics = roles::load_topics_for_role(&role_slug).unwrap_or_default();
+        let responses = db.load_responses(c.id).unwrap_or_default();
+
+        let total_q: usize = topics.iter().map(|t| t.questions.len()).sum();
+        let answered: usize = topics.iter().map(|t| t.answered(&responses)).sum();
+        let score: u32 = topics.iter().map(|t| t.score(&responses)).sum();
+        let max_score: u32 = topics.iter().map(|t| t.max_score()).sum();
+        let date = c.created_at.format("%Y-%m-%d").to_string();
+
+        println!("{:<5} {:<22} {:<20} {:<12} {}",
+            c.id,
+            truncate_str(&c.name, 21),
+            truncate_str(&c.role, 19),
+            format!("{}/{} ({}/{})", answered, total_q, score, max_score),
+            date,
+        );
     }
 
     Ok(())
 }
 
-fn rating_bar(score: u8) -> String {
-    let n = score.min(10) as usize;
-    let filled = "█".repeat(n);
-    let empty = "░".repeat(10 - n);
-    if n >= 8 {
-        format!("{}{}", filled.green(), empty.dimmed())
-    } else if n >= 5 {
-        format!("{}{}", filled.yellow(), empty.dimmed())
-    } else {
-        format!("{}{}", filled.red(), empty.dimmed())
-    }
-}
+fn cmd_export(format: &str, id: i64, output: Option<&PathBuf>, clipboard: bool) -> Result<()> {
+    let db = Db::open()?;
+    let candidate = db.get_candidate(id)?
+        .ok_or_else(|| anyhow::anyhow!("No candidate found with ID {}", id))?;
 
-fn print_interview(i: &Interview) {
-    println!("{}", "─".repeat(52).dimmed());
-    println!("{} — {}", i.candidate.bold(), i.id.cyan());
-    if let Some(r) = &i.role {
-        println!("Role:        {}", r);
+    let role_slug = qb::slugify(&candidate.role);
+    let topics = roles::load_topics_for_role(&role_slug)?;
+    let responses = db.load_responses(candidate.id)?;
+
+    let data = ExportData { candidate: &candidate, topics: &topics, responses: &responses };
+    let slug = qb::slugify(&candidate.name);
+    let base = if slug.is_empty() { candidate.id.to_string() } else { slug };
+
+    if format == "pdf" {
+        if clipboard {
+            bail!("--clipboard is not supported for PDF output");
+        }
+        let bytes = pdf::to_pdf(&data)?;
+        let default_name = format!("{}.pdf", base);
+        return write_output_bytes(&bytes, output, &default_name);
     }
-    if let Some(iv) = &i.interviewer {
-        println!("Interviewer: {}", iv);
-    }
-    println!(
-        "Started:     {}",
-        i.started_at.with_timezone(&Local).format("%Y-%m-%d %H:%M")
-    );
-    let status = match i.status {
-        Status::Active => "Active".green().to_string(),
-        Status::Closed => "Closed".dimmed().to_string(),
+
+    let (content, ext) = match format {
+        "json" => (to_json(&data)?, "json"),
+        "csv"  => (to_csv(&data)?, "csv"),
+        "html" => (to_html(&data)?, "html"),
+        other  => bail!("Unknown format '{}'. Supported: json, csv, html, pdf", other),
     };
-    println!("Status:      {}", status);
 
-    if !i.ratings.is_empty() {
-        println!("\n{}", "Ratings".bold().underline());
-        let mut ratings: Vec<(&String, &u8)> = i.ratings.iter().collect();
-        ratings.sort_by_key(|(k, _)| k.as_str());
-        for (cat, score) in &ratings {
-            println!("  {:<22} {:>2}/10  {}", cat, score, rating_bar(**score));
-        }
-        if let Some(avg) = i.average_rating() {
-            println!("  {:<22} {:.1}/10", "average", avg);
-        }
-    }
-
-    if !i.notes.is_empty() {
-        println!("\n{}", "Notes".bold().underline());
-        for note in &i.notes {
-            let time = note.timestamp.with_timezone(&Local).format("%H:%M");
-            let tag = note
-                .tag
-                .as_deref()
-                .map(|t| format!(" [{}]", t).yellow().to_string())
-                .unwrap_or_default();
-            println!("  [{}]{} {}", time, tag, note.text);
-        }
-    }
-
-    if let Some(v) = &i.verdict {
-        println!("\nVerdict: {}", v.to_string().bold());
-    }
-    if let Some(s) = &i.summary {
-        println!("Summary: {}", s);
-    }
-    println!("{}", "─".repeat(52).dimmed());
+    let default_name = format!("{}.{}", base, ext);
+    write_output(&content, output, clipboard, &default_name)
 }
 
-fn print_report(i: &Interview) {
-    let local_start = i.started_at.with_timezone(&Local);
+fn cmd_qb_gen(topic: &str, num_str: &str, append: bool) -> Result<()> {
+    let counts = parse_num(num_str)?;
+    let slug = qb::slugify(topic);
 
-    println!();
-    println!("{}", "═".repeat(60));
-    println!("{}", "  INTERVIEW REPORT".bold());
-    println!("{}", "═".repeat(60));
-    println!("  Candidate:   {}", i.candidate.bold());
-    if let Some(r) = &i.role {
-        println!("  Role:        {}", r);
-    }
-    if let Some(iv) = &i.interviewer {
-        println!("  Interviewer: {}", iv);
-    }
-    println!("  Date:        {}", local_start.format("%B %d, %Y"));
-    println!("  Started:     {}", local_start.format("%H:%M"));
-    if let Some(closed) = &i.closed_at {
-        let local_end = closed.with_timezone(&Local);
-        let mins = closed.signed_duration_since(i.started_at).num_minutes();
-        println!("  Ended:       {} ({} min)", local_end.format("%H:%M"), mins);
-    }
-    println!();
+    println!(
+        "Generating questions for '{}': {} level-1, {} level-2, {} level-3, {} level-4...",
+        slug, counts[0], counts[1], counts[2], counts[3]
+    );
 
-    if !i.ratings.is_empty() {
-        println!("{}", "  RATINGS".bold());
-        println!("{}", "  ".to_string() + &"─".repeat(48).dimmed().to_string());
-        let mut ratings: Vec<(&String, &u8)> = i.ratings.iter().collect();
-        ratings.sort_by_key(|(k, _)| k.as_str());
-        for (cat, score) in &ratings {
-            println!("  {:<22} {:>2}/10  {}", cat, score, rating_bar(**score));
-        }
-        if let Some(avg) = i.average_rating() {
-            println!();
-            println!("  {:<22} {:.1}/10", "Average Score", avg);
-        }
-        println!();
-    }
+    let content = llm::generate_questions(topic, counts)?;
+    let levels = qb::count_levels(&content);
 
-    if !i.notes.is_empty() {
-        println!("{}", "  NOTES".bold());
-        println!("{}", "  ".to_string() + &"─".repeat(48).dimmed().to_string());
-        for note in &i.notes {
-            let time = note.timestamp.with_timezone(&Local).format("%H:%M");
-            if let Some(tag) = &note.tag {
-                println!(
-                    "  [{}] [{}] {}",
-                    time,
-                    tag.to_uppercase().yellow(),
-                    note.text
-                );
-            } else {
-                println!("  [{}] {}", time, note.text);
-            }
-        }
-        println!();
-    }
+    qb::write_qb(&slug, &content, append)?;
 
-    println!("{}", "  VERDICT".bold());
-    println!("{}", "  ".to_string() + &"─".repeat(48).dimmed().to_string());
-    match &i.verdict {
-        Some(v) => {
-            let display = match v {
-                Verdict::StrongHire | Verdict::Hire => v.to_string().green().bold().to_string(),
-                Verdict::NoHire | Verdict::StrongNoHire => v.to_string().red().bold().to_string(),
-            };
-            println!("  {}", display);
-        }
-        None => println!("  {}", "Pending".yellow()),
+    println!(
+        "Generated: L1={} L2={} L3={} L4={}",
+        levels[0], levels[1], levels[2], levels[3]
+    );
+    Ok(())
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn parse_num(s: &str) -> Result<[u8; 4]> {
+    let parts: Vec<&str> = s.split(',').collect();
+    if parts.len() != 4 {
+        bail!("--num must be 4 comma-separated integers, e.g. 3,3,2,2");
     }
-    if let Some(s) = &i.summary {
-        println!();
-        println!("  {}", s);
+    Ok([
+        parts[0].trim().parse().map_err(|_| anyhow::anyhow!("Invalid number: {}", parts[0]))?,
+        parts[1].trim().parse().map_err(|_| anyhow::anyhow!("Invalid number: {}", parts[1]))?,
+        parts[2].trim().parse().map_err(|_| anyhow::anyhow!("Invalid number: {}", parts[2]))?,
+        parts[3].trim().parse().map_err(|_| anyhow::anyhow!("Invalid number: {}", parts[3]))?,
+    ])
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max.saturating_sub(1)])
     }
-    println!("{}", "═".repeat(60));
-    println!();
 }
