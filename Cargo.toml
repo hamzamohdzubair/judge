@@ -1,6 +1,6 @@
 [package]
 name = "judge"
-version = "0.2.0"
+version = "1.0.0"
 edition = "2021"
 description = "TUI-based technical interview evaluation tool with question banks, live scoring, and exports"
 license = "MIT"
